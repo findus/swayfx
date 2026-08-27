@@ -1,4 +1,5 @@
 #include <float.h>
+#include <math.h>
 #include <libevdev/libevdev.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_subcompositor.h>
@@ -21,11 +22,31 @@
 #include "sway/xwayland.h"
 #endif
 
+// A quick flick commits the swipe even without crossing the 50% distance
+// threshold, matching macOS - tunable, not feel-tested on real hardware.
+static const double WORKSPACE_SWIPE_FLICK_PX_PER_MS = 0.7;
+
+// If more time than this has passed since the last real movement, the
+// fingers were held still before lifting - never treat that as a flick,
+// regardless of how fast the swipe was before the hold.
+static const uint32_t WORKSPACE_SWIPE_HOLD_TIMEOUT_MS = 100;
+
+struct workspace_swipe_state {
+	bool tracking;
+	struct sway_workspace *from_ws;
+	struct sway_workspace *to_ws;   // neighbor currently being revealed, or NULL
+	int direction;                  // +1: to_ws enters from the right, -1: from the left
+	double dx;                      // cumulative raw dx, clamped to [-distance, distance]
+	double last_dx;
+	uint32_t last_time_msec;
+};
+
 struct seatop_default_event {
 	struct sway_node *previous_node;
 	uint32_t pressed_buttons[SWAY_CURSOR_PRESSED_BUTTONS_CAP];
 	size_t pressed_button_count;
 	struct gesture_tracker gestures;
+	struct workspace_swipe_state workspace_swipe;
 };
 
 /*-----------------------------------------\
@@ -1037,16 +1058,166 @@ static void handle_pinch_end(struct sway_seat *seat,
 	}
 }
 
+// Enable (or, via workspace_fade_complete_callback, disable) a workspace's
+// tiling layer and its top-level floating windows together, so a swiped-in
+// neighbor's floaters appear/disappear along with the rest of it.
+static void workspace_swipe_reveal(struct sway_workspace *ws) {
+	wlr_scene_node_set_enabled(&ws->layers.tiling->node, true);
+	for (int i = 0; i < ws->current.floating->length; i++) {
+		struct sway_container *floater = ws->current.floating->items[i];
+		wlr_scene_node_set_enabled(&floater->scene_tree->node, true);
+	}
+}
+
+// Sets up the eased finish for a live workspace swipe, continuing from
+// wherever the live drag left off: either the rest of the way onward
+// (commit) or back home (cancel). Reuses the same animation_state fields
+// and callbacks the discrete workspace_effect=slide switch uses, so this
+// is visually indistinguishable from that once the finger lifts.
+static void workspace_swipe_settle(struct sway_workspace *from_ws,
+		struct sway_workspace *to_ws, int direction, int dx, bool commit) {
+	int distance = from_ws->output->usable_area.width;
+
+	finish_animation(&from_ws->animation_state.animation);
+	from_ws->animation_state.from_offset_x = dx;
+	from_ws->animation_state.to_offset_x = commit ? direction * distance : 0;
+	add_animation(&from_ws->animation_state.animation, workspace_slide_update_callback,
+		commit ? workspace_fade_complete_callback : NULL);
+
+	if (to_ws) {
+		finish_animation(&to_ws->animation_state.animation);
+		to_ws->animation_state.from_offset_x = dx - direction * distance;
+		to_ws->animation_state.to_offset_x = commit ? 0 : direction * distance;
+		add_animation(&to_ws->animation_state.animation, workspace_slide_update_callback,
+			commit ? NULL : workspace_fade_complete_callback);
+	}
+
+	// add_animation() only queues these onto the animation manager's list -
+	// unlike the discrete workspace_effect=slide path, nothing here goes
+	// through a transaction commit (transaction.c is what normally calls
+	// this), so without kicking the timer ourselves the queued animations
+	// would just sit there and the workspace would stay frozen wherever the
+	// live drag left it, e.g. on cancel where no workspace_switch() happens.
+	start_animations();
+}
+
+static void workspace_swipe_update(struct workspace_swipe_state *swipe,
+		struct wlr_pointer_swipe_update_event *event) {
+	struct sway_workspace *from_ws = swipe->from_ws;
+	if (!from_ws->output) {
+		swipe->tracking = false;
+		return;
+	}
+	int distance = from_ws->output->usable_area.width;
+	if (distance <= 0) {
+		return;
+	}
+
+	swipe->dx += event->dx;
+	if (swipe->dx > distance) {
+		swipe->dx = distance;
+	} else if (swipe->dx < -distance) {
+		swipe->dx = -distance;
+	}
+
+	// Negative dx (fingers moving left) reveals the next workspace from the
+	// right, mirroring the discrete workspace_effect=slide direction/1
+	// convention and macOS's swipe-left-for-next-space behavior.
+	int wanted_direction = swipe->dx < 0 ? 1 : swipe->dx > 0 ? -1 : swipe->direction;
+	if (wanted_direction != 0 && wanted_direction != swipe->direction) {
+		struct sway_workspace *neighbor = wanted_direction == 1 ?
+			workspace_output_next(from_ws) : workspace_output_prev(from_ws);
+		if (neighbor == from_ws || neighbor->current.fullscreen) {
+			// No other (non-fullscreen) workspace on this output in that
+			// direction - nothing to reveal, don't let the drag go anywhere.
+			neighbor = NULL;
+		}
+		if (swipe->to_ws && swipe->to_ws != neighbor) {
+			workspace_set_slide_offset(swipe->to_ws, swipe->direction * distance);
+			workspace_fade_complete_callback(swipe->to_ws);
+		}
+		swipe->to_ws = neighbor;
+		swipe->direction = wanted_direction;
+		if (neighbor) {
+			workspace_swipe_reveal(neighbor);
+		} else {
+			swipe->dx = 0;
+		}
+	}
+
+	workspace_set_slide_offset(from_ws, swipe->dx);
+	if (swipe->to_ws) {
+		workspace_set_slide_offset(swipe->to_ws, swipe->dx - swipe->direction * distance);
+	}
+
+	swipe->last_dx = event->dx;
+	swipe->last_time_msec = event->time_msec;
+}
+
+static void workspace_swipe_end(struct sway_seat *seat,
+		struct workspace_swipe_state *swipe, struct wlr_pointer_swipe_end_event *event) {
+	swipe->tracking = false;
+
+	struct sway_workspace *from_ws = swipe->from_ws;
+	struct sway_workspace *to_ws = swipe->to_ws;
+	if (!to_ws) {
+		// Never dragged far enough to reveal a neighbor - nothing to settle.
+		return;
+	}
+
+	bool commit = false;
+	if (!event->cancelled) {
+		int distance = from_ws->output->usable_area.width;
+		double traveled = distance > 0 ? fabs(swipe->dx) / distance : 0;
+		uint32_t dt = event->time_msec - swipe->last_time_msec;
+		double velocity = (dt > 0 && dt < WORKSPACE_SWIPE_HOLD_TIMEOUT_MS) ?
+			fabs(swipe->last_dx) / dt : 0;
+		commit = traveled > 0.5 || velocity > WORKSPACE_SWIPE_FLICK_PX_PER_MS;
+	}
+
+	workspace_swipe_settle(from_ws, to_ws, swipe->direction, (int)swipe->dx, commit);
+
+	if (commit) {
+		// Flip prev_active_workspace ourselves before the real switch lands,
+		// so arrange_output's own is_ws_switch check sees old==new and
+		// doesn't replay the slide a second time from a cold start once the
+		// transaction this triggers actually commits.
+		struct sway_output *output = from_ws->output;
+		output->prev_active_workspace = to_ws;
+		workspace_switch(to_ws);
+		seat_consider_warp_to_focus(seat);
+	}
+}
+
 static void handle_swipe_begin(struct sway_seat *seat,
 		struct wlr_pointer_swipe_begin_event *event) {
-	// Start tracking gesture if there is a matching binding ...
 	struct sway_input_device *device =
 		event->pointer ? event->pointer->base.data : NULL;
 	list_t *bindings = config->current_mode->gesture_bindings;
+	struct seatop_default_event *seatop = seat->seatop_data;
+
+	bool claimed = false;
+	// Start tracking gesture if there is a matching binding ...
 	if (gesture_binding_check(bindings, GESTURE_TYPE_SWIPE, event->fingers, device)) {
-		struct seatop_default_event *seatop = seat->seatop_data;
 		gesture_tracker_begin(&seatop->gestures, GESTURE_TYPE_SWIPE, event->fingers);
-	} else {
+		claimed = true;
+	} else if (config->workspace_swipe && event->fingers == 3 &&
+			!seatop->workspace_swipe.tracking) {
+		// ... otherwise claim a 3-finger swipe for live workspace switching,
+		// unless the focused workspace is fullscreen (matches
+		// workspace_effect's own fullscreen exclusion).
+		struct sway_workspace *ws = seat_get_focused_workspace(seat);
+		if (ws && !ws->current.fullscreen) {
+			seatop->workspace_swipe = (struct workspace_swipe_state){
+				.tracking = true,
+				.from_ws = ws,
+				.last_time_msec = event->time_msec,
+			};
+			claimed = true;
+		}
+	}
+
+	if (!claimed) {
 		// ... otherwise forward to client
 		struct sway_cursor *cursor = seat->cursor;
 		wlr_pointer_gestures_v1_send_swipe_begin(
@@ -1063,6 +1234,8 @@ static void handle_swipe_update(struct sway_seat *seat,
 	if (gesture_tracker_check(&seatop->gestures, GESTURE_TYPE_SWIPE)) {
 		gesture_tracker_update(&seatop->gestures,
 			event->dx, event->dy, NAN, NAN);
+	} else if (seatop->workspace_swipe.tracking) {
+		workspace_swipe_update(&seatop->workspace_swipe, event);
 	} else {
 		// ... otherwise forward to client
 		struct sway_cursor *cursor = seat->cursor;
@@ -1074,27 +1247,27 @@ static void handle_swipe_update(struct sway_seat *seat,
 
 static void handle_swipe_end(struct sway_seat *seat,
 		struct wlr_pointer_swipe_end_event *event) {
-	// Ensure gesture is being tracked and was not cancelled
 	struct seatop_default_event *seatop = seat->seatop_data;
-	if (!gesture_tracker_check(&seatop->gestures, GESTURE_TYPE_SWIPE)) {
+	if (gesture_tracker_check(&seatop->gestures, GESTURE_TYPE_SWIPE)) {
+		// End gesture tracking and execute matched binding
+		if (event->cancelled) {
+			gesture_tracker_cancel(&seatop->gestures);
+			return;
+		}
+		struct sway_input_device *device =
+			event->pointer ? event->pointer->base.data : NULL;
+		struct sway_gesture_binding *binding = gesture_tracker_end_and_match(
+			&seatop->gestures, device);
+		if (binding) {
+			gesture_binding_execute(seat, binding);
+		}
+	} else if (seatop->workspace_swipe.tracking) {
+		workspace_swipe_end(seat, &seatop->workspace_swipe, event);
+	} else {
+		// ... otherwise forward to client
 		struct sway_cursor *cursor = seat->cursor;
 		wlr_pointer_gestures_v1_send_swipe_end(server.input->pointer_gestures,
 			cursor->seat->wlr_seat, event->time_msec, event->cancelled);
-		return;
-	}
-	if (event->cancelled) {
-		gesture_tracker_cancel(&seatop->gestures);
-		return;
-	}
-
-	// End gesture tracking and execute matched binding
-	struct sway_input_device *device =
-		event->pointer ? event->pointer->base.data : NULL;
-	struct sway_gesture_binding *binding = gesture_tracker_end_and_match(
-		&seatop->gestures, device);
-
-	if (binding) {
-		gesture_binding_execute(seat, binding);
 	}
 }
 

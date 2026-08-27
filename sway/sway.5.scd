@@ -430,6 +430,15 @@ workspace_effect fade|slide|none
 	swipe-between-desktops transition. _none_ disables the transition.
 	Has no effect while _animation_duration_ms_ is 0.
 
+workspace_swipe enable|disable
+	Enables (the default) or disables live 3-finger touchpad swipe workspace
+	switching. A quick swipe changes to the next/previous workspace on the
+	swiped output; a slow, held swipe drags the workspace across 1:1 with
+	your fingers until released, snapping to whichever side crosses 50% of
+	the output width or is released with enough speed, and snapping back
+	otherwise. Takes a lower priority than any _bindgesture_ binding for a
+	3-finger swipe, if one is configured.
+
 *assign* <criteria> [→] [workspace] [number] <workspace>
 	Assigns windows matching _criteria_ (see *CRITERIA* for details) to
 	_workspace_. The → (U+2192) is optional and cosmetic. This command is

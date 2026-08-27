@@ -115,7 +115,7 @@ static void workspace_fade_update_callback(void *data) {
 	workspace_for_each_container(ws, _fade_container_update, NULL);
 }
 
-static void workspace_fade_complete_callback(void *data) {
+void workspace_fade_complete_callback(void *data) {
 	struct sway_workspace *ws = data;
 	if (!ws || !ws->output) {
 		return;
@@ -132,16 +132,13 @@ static void workspace_fade_complete_callback(void *data) {
 	}
 }
 
-static void workspace_slide_update_callback(void *data) {
-	struct sway_workspace *ws = data;
+void workspace_set_slide_offset(struct sway_workspace *ws, int offset) {
 	if (!ws || !ws->output) {
 		return;
 	}
 	struct sway_output *output = ws->output;
 	struct wlr_box *area = &output->usable_area;
 	struct side_gaps *gaps = &ws->current_gaps;
-	int offset = get_animated_value(ws->animation_state.from_offset_x,
-		ws->animation_state.to_offset_x, &ws->animation_state.animation);
 
 	wlr_scene_node_set_position(&ws->layers.tiling->node,
 		gaps->left + area->x + offset, gaps->top + area->y);
@@ -151,6 +148,16 @@ static void workspace_slide_update_callback(void *data) {
 		wlr_scene_node_set_position(&floater->scene_tree->node,
 			floater->current.x + offset, floater->current.y);
 	}
+}
+
+void workspace_slide_update_callback(void *data) {
+	struct sway_workspace *ws = data;
+	if (!ws || !ws->output) {
+		return;
+	}
+	int offset = get_animated_value(ws->animation_state.from_offset_x,
+		ws->animation_state.to_offset_x, &ws->animation_state.animation);
+	workspace_set_slide_offset(ws, offset);
 }
 
 /* Compensate for scene-graph reparenting by computing the drift between

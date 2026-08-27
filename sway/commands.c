@@ -121,6 +121,7 @@ static const struct cmd_handler handlers[] = {
 	{ "workspace", cmd_workspace },
 	{ "workspace_auto_back_and_forth", cmd_ws_auto_back_and_forth },
 	{ "workspace_effect", cmd_workspace_effect },
+	{ "workspace_swipe", cmd_workspace_swipe },
 };
 
 /* Config-time only commands. Keep alphabetized */

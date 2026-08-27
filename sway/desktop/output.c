@@ -79,6 +79,16 @@ struct sway_workspace *output_get_active_workspace(struct sway_output *output) {
 	struct sway_seat *seat = input_manager_current_seat();
 	struct sway_node *focus = seat_get_active_tiling_child(seat, &output->node);
 	if (!focus) {
+		// The seat's tiling focus stack has no entry for this output right
+		// now, e.g. while a layer-shell surface (a swaynag banner, a lock
+		// screen prompt, etc.) holds keyboard focus. Prefer the last workspace
+		// this output was actually showing over an arbitrary list index -
+		// otherwise this looks exactly like a real workspace switch to
+		// whichever caller re-derives "the" active workspace mid-transaction
+		// (e.g. workspace_effect's fade/slide would replay for nothing).
+		if (output->prev_active_workspace) {
+			return output->prev_active_workspace;
+		}
 		if (!output->workspaces->length) {
 			return NULL;
 		}

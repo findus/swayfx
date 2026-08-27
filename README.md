@@ -72,6 +72,7 @@ For Fedora users, SwayFX is also available in [copr](https://copr.fedorainfraclo
 + Keep/remove separator border between titlebar and content: `titlebar_separator enable|disable`
 + Treat Scratchpad as minimized: `scratchpad_minimize enable|disable`: **we recommend keeping this setting off, as there are many kinks to iron out here**
 + Choose the workspace switch transition: `workspace_effect fade|slide|none` (default `fade`); requires `animation_duration_ms` to be non-zero
++ Live 3-finger touchpad swipe to switch workspaces, macOS-style: `workspace_swipe enable|disable` (default `enable`)
 
 
 ## Compiling From Source

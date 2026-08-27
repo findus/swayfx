@@ -88,6 +88,12 @@ struct sway_workspace *workspace_by_number(const char* name);
 
 int workspace_get_number(struct sway_workspace *workspace);
 
+void workspace_set_slide_offset(struct sway_workspace *ws, int offset);
+
+void workspace_slide_update_callback(void *data);
+
+void workspace_fade_complete_callback(void *data);
+
 struct sway_workspace *workspace_by_name(const char*);
 
 struct sway_workspace *workspace_output_next(struct sway_workspace *current);
