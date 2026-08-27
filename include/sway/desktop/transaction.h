@@ -24,6 +24,7 @@
 
 struct sway_transaction_instruction;
 struct sway_view;
+struct sway_workspace;
 
 /**
  * Find all dirty containers, create and commit a transaction containing them,
@@ -61,5 +62,18 @@ bool transaction_notify_view_ready_by_geometry(struct sway_view *view,
 		double x, double y, int width, int height);
 
 void arrange_popups(struct wlr_scene_tree *popups);
+
+/**
+ * Re-send fresh xdg_toplevel configure events (size, and implicitly output
+ * scale) to a workspace's floating/tiling containers. Normally only called
+ * as part of arrange_output's per-transaction pass; exposed so a workspace
+ * that's being shown outside that pass for the first time (e.g. a live
+ * workspace-swipe reveal) can still get a proper configure instead of
+ * whatever stale geometry it last had - clients like Electron/GTK apps can
+ * otherwise render at the wrong scale until something else (e.g. focus)
+ * happens to trigger a resize.
+ */
+void arrange_workspace_floating(struct sway_workspace *ws);
+void arrange_workspace_tiling(struct sway_workspace *ws, int width, int height);
 
 #endif

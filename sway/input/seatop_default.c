@@ -8,6 +8,7 @@
 #include "gesture.h"
 #include "sway/desktop/transaction.h"
 #include "sway/input/cursor.h"
+#include "sway/input/input-manager.h"
 #include "sway/input/seat.h"
 #include "sway/input/tablet.h"
 #include "sway/layers.h"
@@ -22,23 +23,37 @@
 #include "sway/xwayland.h"
 #endif
 
-// A quick flick commits the swipe even without crossing the 50% distance
-// threshold, matching macOS - tunable, not feel-tested on real hardware.
-static const double WORKSPACE_SWIPE_FLICK_PX_PER_MS = 0.7;
+// A quick flick commits the swipe even without crossing the distance
+// threshold below, matching macOS - tunable, not feel-tested on real
+// hardware.
+static const double WORKSPACE_SWIPE_FLICK_PX_PER_MS = 0.3;
 
-// If more time than this has passed since the last real movement, the
-// fingers were held still before lifting - never treat that as a flick,
-// regardless of how fast the swipe was before the hold.
-static const uint32_t WORKSPACE_SWIPE_HOLD_TIMEOUT_MS = 100;
+// Fraction of the output's width that needs to be dragged to commit
+// without a fast-enough flick.
+static const double WORKSPACE_SWIPE_COMMIT_FRACTION = 0.4;
+
+// Release velocity is measured over this trailing window rather than just
+// the last swipe_update event's delta: fingers naturally decelerate right
+// as they lift off, so a single-sample velocity systematically
+// under-detects genuine fast flicks. A held-still-then-release gesture
+// still correctly measures near-zero, since the window "catches up" to
+// reflect no motion once the hold has lasted this long.
+static const uint32_t WORKSPACE_SWIPE_VELOCITY_WINDOW_MS = 60;
 
 struct workspace_swipe_state {
 	bool tracking;
 	struct sway_workspace *from_ws;
-	struct sway_workspace *to_ws;   // neighbor currently being revealed, or NULL
-	int direction;                  // +1: to_ws enters from the right, -1: from the left
+	// Both revealed and parked fully off-screen as soon as the gesture
+	// starts, so there's no reveal-latency once a direction is picked -
+	// either can be NULL if there's no workspace on this output that way.
+	struct sway_workspace *next_ws; // enters from the right, direction +1
+	struct sway_workspace *prev_ws; // enters from the left, direction -1
+	int direction;                  // 0: undecided, +1: next_ws engaged, -1: prev_ws engaged
 	double dx;                      // cumulative raw dx, clamped to [-distance, distance]
-	double last_dx;
-	uint32_t last_time_msec;
+	// Rolling checkpoint used to measure release velocity over the last
+	// WORKSPACE_SWIPE_VELOCITY_WINDOW_MS rather than a single sample.
+	double checkpoint_dx;
+	uint32_t checkpoint_time_msec;
 };
 
 struct seatop_default_event {
@@ -1067,6 +1082,49 @@ static void workspace_swipe_reveal(struct sway_workspace *ws) {
 		struct sway_container *floater = ws->current.floating->items[i];
 		wlr_scene_node_set_enabled(&floater->scene_tree->node, true);
 	}
+
+	// Send a fresh configure to this workspace's containers, same as a
+	// normal arrange_output pass would - otherwise a workspace that's never
+	// been shown through the usual path since it last had, say, its output
+	// scale change keeps whatever stale size/scale its containers last
+	// configured to, and clients (Signal, other Electron/GTK apps) can
+	// render at the wrong size until something else (focusing it) forces
+	// a resize.
+	if (ws->output) {
+		struct wlr_box *area = &ws->output->usable_area;
+		struct side_gaps *gaps = &ws->current_gaps;
+		arrange_workspace_tiling(ws,
+			area->width - gaps->left - gaps->right,
+			area->height - gaps->top - gaps->bottom);
+	}
+	arrange_workspace_floating(ws);
+
+	// Recompute per-node opacity/corner-radius before it's shown, same as
+	// workspace_fade_update_callback does on every tick - this workspace's
+	// nodes may have been left with stale values from whatever they were
+	// doing (e.g. mid-close-animation) the last time they were visible.
+	output_configure_scene(ws->output, &ws->layers.tiling->node, false, NULL);
+}
+
+// Performs the actual logical workspace switch, but only once to_ws's
+// settle animation has fully finished (this is an animation completion
+// callback, so animation_state.animation is already finish_animation()'d
+// and to_ws is sitting exactly at rest, on-screen, by the time this runs).
+// Doing the switch *before* that - as an earlier version of this did -
+// meant workspace_switch()'s own transaction could land while to_ws was
+// still mid-flight, and arrange_output's is_ws_switch check (which reads
+// output->current.active_workspace / prev_active_workspace completely
+// independently of what this file is animating) could end up re-triggering
+// a second, reversed slide on top of the one already in progress. Settling
+// first and switching after removes any window for that to happen at all.
+static void workspace_swipe_finish_commit(void *data) {
+	struct sway_workspace *to_ws = data;
+	if (!to_ws || !to_ws->output) {
+		return;
+	}
+	to_ws->output->prev_active_workspace = to_ws;
+	workspace_switch(to_ws);
+	seat_consider_warp_to_focus(input_manager_current_seat());
 }
 
 // Sets up the eased finish for a live workspace swipe, continuing from
@@ -1080,16 +1138,16 @@ static void workspace_swipe_settle(struct sway_workspace *from_ws,
 
 	finish_animation(&from_ws->animation_state.animation);
 	from_ws->animation_state.from_offset_x = dx;
-	from_ws->animation_state.to_offset_x = commit ? direction * distance : 0;
+	from_ws->animation_state.to_offset_x = commit ? -direction * distance : 0;
 	add_animation(&from_ws->animation_state.animation, workspace_slide_update_callback,
 		commit ? workspace_fade_complete_callback : NULL);
 
 	if (to_ws) {
 		finish_animation(&to_ws->animation_state.animation);
-		to_ws->animation_state.from_offset_x = dx - direction * distance;
+		to_ws->animation_state.from_offset_x = dx + direction * distance;
 		to_ws->animation_state.to_offset_x = commit ? 0 : direction * distance;
 		add_animation(&to_ws->animation_state.animation, workspace_slide_update_callback,
-			commit ? NULL : workspace_fade_complete_callback);
+			commit ? workspace_swipe_finish_commit : workspace_fade_complete_callback);
 	}
 
 	// add_animation() only queues these onto the animation manager's list -
@@ -1120,48 +1178,65 @@ static void workspace_swipe_update(struct workspace_swipe_state *swipe,
 		swipe->dx = -distance;
 	}
 
-	// Negative dx (fingers moving left) reveals the next workspace from the
+	// Negative dx (fingers moving left) engages next_ws, entering from the
 	// right, mirroring the discrete workspace_effect=slide direction/1
 	// convention and macOS's swipe-left-for-next-space behavior.
 	int wanted_direction = swipe->dx < 0 ? 1 : swipe->dx > 0 ? -1 : swipe->direction;
-	if (wanted_direction != 0 && wanted_direction != swipe->direction) {
-		struct sway_workspace *neighbor = wanted_direction == 1 ?
-			workspace_output_next(from_ws) : workspace_output_prev(from_ws);
-		if (neighbor == from_ws || neighbor->current.fullscreen) {
-			// No other (non-fullscreen) workspace on this output in that
-			// direction - nothing to reveal, don't let the drag go anywhere.
-			neighbor = NULL;
-		}
-		if (swipe->to_ws && swipe->to_ws != neighbor) {
-			workspace_set_slide_offset(swipe->to_ws, swipe->direction * distance);
-			workspace_fade_complete_callback(swipe->to_ws);
-		}
-		swipe->to_ws = neighbor;
-		swipe->direction = wanted_direction;
-		if (neighbor) {
-			workspace_swipe_reveal(neighbor);
-		} else {
-			swipe->dx = 0;
-		}
+	if (wanted_direction == 1 && !swipe->next_ws) {
+		wanted_direction = 0;
+		swipe->dx = 0;
+	} else if (wanted_direction == -1 && !swipe->prev_ws) {
+		wanted_direction = 0;
+		swipe->dx = 0;
 	}
+	swipe->direction = wanted_direction;
 
 	workspace_set_slide_offset(from_ws, swipe->dx);
-	if (swipe->to_ws) {
-		workspace_set_slide_offset(swipe->to_ws, swipe->dx - swipe->direction * distance);
+
+	if (swipe->next_ws && swipe->next_ws == swipe->prev_ws) {
+		// Only one other workspace on this output - it can approach from
+		// either side depending on drag direction, so it needs a single
+		// combined offset rather than the two independent ones below.
+		int offset = wanted_direction == 1 ? swipe->dx + distance :
+			wanted_direction == -1 ? swipe->dx - distance : distance;
+		workspace_set_slide_offset(swipe->next_ws, offset);
+	} else {
+		if (swipe->next_ws) {
+			int offset = wanted_direction == 1 ? swipe->dx + distance : distance;
+			workspace_set_slide_offset(swipe->next_ws, offset);
+		}
+		if (swipe->prev_ws) {
+			int offset = wanted_direction == -1 ? swipe->dx - distance : -distance;
+			workspace_set_slide_offset(swipe->prev_ws, offset);
+		}
 	}
 
-	swipe->last_dx = event->dx;
-	swipe->last_time_msec = event->time_msec;
+	if (event->time_msec - swipe->checkpoint_time_msec >= WORKSPACE_SWIPE_VELOCITY_WINDOW_MS) {
+		swipe->checkpoint_dx = swipe->dx;
+		swipe->checkpoint_time_msec = event->time_msec;
+	}
 }
 
-static void workspace_swipe_end(struct sway_seat *seat,
-		struct workspace_swipe_state *swipe, struct wlr_pointer_swipe_end_event *event) {
+static void workspace_swipe_end(struct workspace_swipe_state *swipe,
+		struct wlr_pointer_swipe_end_event *event) {
 	swipe->tracking = false;
 
 	struct sway_workspace *from_ws = swipe->from_ws;
-	struct sway_workspace *to_ws = swipe->to_ws;
+	struct sway_workspace *to_ws = swipe->direction == 1 ? swipe->next_ws :
+		swipe->direction == -1 ? swipe->prev_ws : NULL;
+
+	// Hide whichever pre-revealed neighbor never got engaged - it's still
+	// parked fully off-screen (or was never engaged at all), so this is a
+	// plain disable, nothing to animate.
+	if (swipe->next_ws && swipe->next_ws != to_ws) {
+		workspace_fade_complete_callback(swipe->next_ws);
+	}
+	if (swipe->prev_ws && swipe->prev_ws != to_ws && swipe->prev_ws != swipe->next_ws) {
+		workspace_fade_complete_callback(swipe->prev_ws);
+	}
+
 	if (!to_ws) {
-		// Never dragged far enough to reveal a neighbor - nothing to settle.
+		// Never dragged far enough to engage a neighbor - nothing to settle.
 		return;
 	}
 
@@ -1169,24 +1244,15 @@ static void workspace_swipe_end(struct sway_seat *seat,
 	if (!event->cancelled) {
 		int distance = from_ws->output->usable_area.width;
 		double traveled = distance > 0 ? fabs(swipe->dx) / distance : 0;
-		uint32_t dt = event->time_msec - swipe->last_time_msec;
-		double velocity = (dt > 0 && dt < WORKSPACE_SWIPE_HOLD_TIMEOUT_MS) ?
-			fabs(swipe->last_dx) / dt : 0;
-		commit = traveled > 0.5 || velocity > WORKSPACE_SWIPE_FLICK_PX_PER_MS;
+		uint32_t dt = event->time_msec - swipe->checkpoint_time_msec;
+		double velocity = dt > 0 ? fabs(swipe->dx - swipe->checkpoint_dx) / dt : 0;
+		commit = traveled > WORKSPACE_SWIPE_COMMIT_FRACTION ||
+			velocity > WORKSPACE_SWIPE_FLICK_PX_PER_MS;
 	}
 
+	// The actual workspace_switch() happens in workspace_swipe_finish_commit,
+	// once to_ws's settle animation above completes - see its comment.
 	workspace_swipe_settle(from_ws, to_ws, swipe->direction, (int)swipe->dx, commit);
-
-	if (commit) {
-		// Flip prev_active_workspace ourselves before the real switch lands,
-		// so arrange_output's own is_ws_switch check sees old==new and
-		// doesn't replay the slide a second time from a cold start once the
-		// transaction this triggers actually commits.
-		struct sway_output *output = from_ws->output;
-		output->prev_active_workspace = to_ws;
-		workspace_switch(to_ws);
-		seat_consider_warp_to_focus(seat);
-	}
 }
 
 static void handle_swipe_begin(struct sway_seat *seat,
@@ -1207,12 +1273,38 @@ static void handle_swipe_begin(struct sway_seat *seat,
 		// unless the focused workspace is fullscreen (matches
 		// workspace_effect's own fullscreen exclusion).
 		struct sway_workspace *ws = seat_get_focused_workspace(seat);
-		if (ws && !ws->current.fullscreen) {
+		if (ws && !ws->current.fullscreen && ws->output) {
+			int distance = ws->output->usable_area.width;
+
+			struct sway_workspace *next = workspace_output_next(ws);
+			if (next == ws || next->current.fullscreen) {
+				next = NULL;
+			}
+			struct sway_workspace *prev = workspace_output_prev(ws);
+			if (prev == ws || prev->current.fullscreen) {
+				prev = NULL;
+			}
+
 			seatop->workspace_swipe = (struct workspace_swipe_state){
 				.tracking = true,
 				.from_ws = ws,
-				.last_time_msec = event->time_msec,
+				.next_ws = next,
+				.prev_ws = prev,
+				.checkpoint_time_msec = event->time_msec,
 			};
+
+			// Reveal and park both up front so the very first pixel of
+			// movement in either direction has something to slide in
+			// already showing, instead of only enabling it once a
+			// direction is picked.
+			if (next) {
+				workspace_swipe_reveal(next);
+				workspace_set_slide_offset(next, distance);
+			}
+			if (prev && prev != next) {
+				workspace_swipe_reveal(prev);
+				workspace_set_slide_offset(prev, -distance);
+			}
 			claimed = true;
 		}
 	}
@@ -1262,7 +1354,7 @@ static void handle_swipe_end(struct sway_seat *seat,
 			gesture_binding_execute(seat, binding);
 		}
 	} else if (seatop->workspace_swipe.tracking) {
-		workspace_swipe_end(seat, &seatop->workspace_swipe, event);
+		workspace_swipe_end(&seatop->workspace_swipe, event);
 	} else {
 		// ... otherwise forward to client
 		struct sway_cursor *cursor = seat->cursor;

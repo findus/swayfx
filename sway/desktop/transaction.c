@@ -850,7 +850,7 @@ static void arrange_fullscreen(struct wlr_scene_tree *tree,
 	wlr_scene_node_set_position(fs_node, 0, 0);
 }
 
-static void arrange_workspace_floating(struct sway_workspace *ws) {
+void arrange_workspace_floating(struct sway_workspace *ws) {
 	for (int i = 0; i < ws->current.floating->length; i++) {
 		struct sway_container *floater = ws->current.floating->items[i];
 		struct wlr_scene_tree *layer = root->layers.floating;
@@ -885,7 +885,7 @@ static void arrange_workspace_floating(struct sway_workspace *ws) {
 	}
 }
 
-static void arrange_workspace_tiling(struct sway_workspace *ws,
+void arrange_workspace_tiling(struct sway_workspace *ws,
 		int width, int height) {
 	arrange_children(ws->current.layout, ws->current.tiling,
 		ws->current.focused_inactive_child, ws->layers.tiling,
