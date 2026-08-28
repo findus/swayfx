@@ -1285,27 +1285,41 @@ static void handle_swipe_begin(struct sway_seat *seat,
 				prev = NULL;
 			}
 
-			seatop->workspace_swipe = (struct workspace_swipe_state){
-				.tracking = true,
-				.from_ws = ws,
-				.next_ws = next,
-				.prev_ws = prev,
-				.checkpoint_time_msec = event->time_msec,
-			};
+			// If any of these are still finishing a previous swipe's
+			// settle animation, don't start a new live-track cycle on top
+			// of it: the old animation would keep ticking and fighting
+			// the new one's position/enabled-state every frame until it
+			// completes (and, if it was a commit, its completion callback
+			// would still fire mid-new-gesture). Simplest safe fix is to
+			// just wait the ~animation_duration_ms out.
+			bool still_settling =
+				(ws->animation_state.animation.initialized) ||
+				(next && next->animation_state.animation.initialized) ||
+				(prev && prev->animation_state.animation.initialized);
 
-			// Reveal and park both up front so the very first pixel of
-			// movement in either direction has something to slide in
-			// already showing, instead of only enabling it once a
-			// direction is picked.
-			if (next) {
-				workspace_swipe_reveal(next);
-				workspace_set_slide_offset(next, distance);
+			if (!still_settling) {
+				seatop->workspace_swipe = (struct workspace_swipe_state){
+					.tracking = true,
+					.from_ws = ws,
+					.next_ws = next,
+					.prev_ws = prev,
+					.checkpoint_time_msec = event->time_msec,
+				};
+
+				// Reveal and park both up front so the very first pixel of
+				// movement in either direction has something to slide in
+				// already showing, instead of only enabling it once a
+				// direction is picked.
+				if (next) {
+					workspace_swipe_reveal(next);
+					workspace_set_slide_offset(next, distance);
+				}
+				if (prev && prev != next) {
+					workspace_swipe_reveal(prev);
+					workspace_set_slide_offset(prev, -distance);
+				}
+				claimed = true;
 			}
-			if (prev && prev != next) {
-				workspace_swipe_reveal(prev);
-				workspace_set_slide_offset(prev, -distance);
-			}
-			claimed = true;
 		}
 	}
 
