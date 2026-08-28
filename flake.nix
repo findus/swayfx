@@ -12,10 +12,7 @@
     };
 
     scenefx = {
-      # Local fork (~/repos/scenefx, branch workspace-slide-animation) with
-      # wlr_scene_node_set_output_affinity(), used to keep an off-screen
-      # slide animation from rendering onto a neighboring output.
-      url = "path:/home/findus/repos/scenefx";
+      url = "github:wlrfx/scenefx";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.flake-utils.follows = "flake-utils";
     };

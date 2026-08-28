@@ -55,14 +55,17 @@
         "systems": "systems"
       },
       "locked": {
-        "lastModified": 1787925850,
-        "narHash": "sha256-rzPbszSxc3/1N8SS7oLdVqFXQZBC+1d7q5/Ci6shPZw=",
-        "path": "/home/findus/repos/scenefx",
-        "type": "path"
+        "lastModified": 1786462793,
+        "narHash": "sha256-XBUAgJN3TwDC6ilG4xAXcj/BMSPbGZOkpWW0Y1qvy/c=",
+        "owner": "wlrfx",
+        "repo": "scenefx",
+        "rev": "26200c5d9fa947a1d3b0935d3f9237229cd3e5ba",
+        "type": "github"
       },
       "original": {
-        "path": "/home/findus/repos/scenefx",
-        "type": "path"
+        "owner": "wlrfx",
+        "repo": "scenefx",
+        "type": "github"
       }
     },
     "systems": {
