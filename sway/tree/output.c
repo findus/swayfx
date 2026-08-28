@@ -120,6 +120,15 @@ struct sway_output *output_create(struct wlr_output *wlr_output) {
 	output->layers.session_lock = alloc_scene_tree(root->staging, &failed);
 
 	if (!failed) {
+		// Tiled content is never meant to be shown on any output but this
+		// one - without this, an off-screen slide animation (workspace_effect
+		// slide / workspace_swipe) that moves this tree past its own
+		// output's edge would render on a neighboring output too, since
+		// wlr_scene has no concept of node ownership otherwise, only
+		// geometric overlap.
+		wlr_scene_node_set_output_affinity(&output->layers.tiling->node, wlr_output);
+		wlr_scene_node_set_output_affinity(&output->layers.fullscreen->node, wlr_output);
+
 		output->fullscreen_background = wlr_scene_rect_create(
 			output->layers.fullscreen, 0, 0, (float[4]){0.f, 0.f, 0.f, 1.f});
 
