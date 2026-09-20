@@ -2016,8 +2016,17 @@ void container_swap(struct sway_container *con1, struct sway_container *con2) {
 }
 
 bool container_has_shadow(struct sway_container *con) {
-	return con->shadow_enabled
+	bool shadow_enabled = con->shadow_enabled
 		&& (con->current.border != B_CSD || config->shadows_on_csd_enabled);
+
+	if (!con->current.workspace) {
+		return shadow_enabled;
+	}
+
+	struct side_gaps gaps = con->current.workspace->current_gaps;
+	bool has_gaps = gaps.top > 0 || gaps.right > 0 || gaps.bottom > 0 || gaps.left > 0;
+
+	return (container_is_floating_or_child(con) || has_gaps) && shadow_enabled;
 }
 
 bool container_has_corner_radius(struct sway_container *con) {
