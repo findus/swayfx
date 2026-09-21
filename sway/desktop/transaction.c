@@ -997,7 +997,8 @@ static void arrange_output(struct sway_output *output, int width, int height) {
 
 		finish_animation(&old_active->animation_state.animation);
 		old_active->animation_state.from_alpha = 1.0f;
-		old_active->animation_state.to_alpha = 0.0f;
+		//TODO test
+		old_active->animation_state.to_alpha = 1.0f;
 	}
 
 	for (int i = 0; i < output->current.workspaces->length; i++) {
